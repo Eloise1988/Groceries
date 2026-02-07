@@ -4,12 +4,12 @@ A Telegram bot that keeps your grocery list, learns from what you add/accept, an
 
 ## Features
 - `/add <item>` add items
-- `/remove <item>` remove an item
-- `/removeall <item>` remove all of a specific item
+- `/remove` select items to remove
 - `/clear` clear the whole list
 - `/list` show the current list
 - `/suggest` send suggestions now
 - `/recipe <url>` import ingredients from a recipe URL and pick what to add
+- `/steps <url>` show ingredients and numbered steps
 - `/id` show this chat id
 - `/help` show all commands
 - Weekly suggestions every Monday at 09:00 (server timezone)

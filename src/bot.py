@@ -1,9 +1,13 @@
 import logging
 import asyncio
+import json
 from math import ceil
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
+import requests
+from bs4 import BeautifulSoup
 from recipe_scrapers import scrape_me
 from bson import ObjectId
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -18,12 +22,46 @@ from telegram.ext import (
 
 from .config import BOT_TOKEN, ADMIN_CHAT_ID_INT, SUGGESTION_COUNT, TIMEZONE
 from .db import get_db
-from .llm import llm_enabled, llm_parse_ingredients
+from .llm import llm_enabled, llm_parse_ingredients, llm_extract_recipe_from_html
 from .suggestions import build_suggestions, record_feedback
 from .utils import normalize_item, parse_item, now_utc, simplify_ingredient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def fetch_url_with_fallback(url: str):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+    last_status = None
+    last_exc = None
+
+    for _ in range(3):
+        try:
+            resp = requests.get(url, timeout=20, headers=headers)
+            last_status = resp.status_code
+            if resp.status_code < 500 and resp.text.strip():
+                return resp.text, resp.status_code
+        except Exception as exc:
+            last_exc = exc
+
+    mirror_url = "https://r.jina.ai/http://" + quote(url, safe=":/?&=#")
+    try:
+        mirror_resp = requests.get(mirror_url, timeout=30, headers=headers)
+        if mirror_resp.ok and mirror_resp.text.strip():
+            return mirror_resp.text, mirror_resp.status_code
+        last_status = mirror_resp.status_code
+    except Exception as exc:
+        last_exc = exc
+
+    if last_exc:
+        raise RuntimeError(f"Could not fetch URL ({last_exc})")
+    raise RuntimeError(f"Could not fetch URL (HTTP {last_status})")
 
 
 def is_authorized(update: Update) -> bool:
@@ -140,39 +178,11 @@ async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = " ".join(context.args)
     name_raw = parse_item(text)
-    if not name_raw:
-        await start_remove_session_ui(update)
+    if name_raw:
+        await update.message.reply_text("Use /remove to select items to delete.")
         return
 
-    name = normalize_item(name_raw)
-    db = get_db()
-    items = db.items
-
-    result = await items.delete_one({"chat_id": update.effective_chat.id, "name": name})
-    if result.deleted_count == 0:
-        await update.message.reply_text("Item not found in your list.")
-    else:
-        await update.message.reply_text(f"Removed {name_raw}.")
-
-
-async def remove_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
-
-    text = " ".join(context.args)
-    name_raw = text.strip()
-    if not name_raw:
-        await update.message.reply_text("Usage: /removeall <item>")
-        return
-
-    name = normalize_item(name_raw)
-    db = get_db()
-    result = await db.items.delete_one({"chat_id": update.effective_chat.id, "name": name})
-
-    if result.deleted_count == 0:
-        await update.message.reply_text("Item not found in your list.")
-    else:
-        await update.message.reply_text(f"Removed all of {name_raw}.")
+    await start_remove_session_ui(update)
 
 
 async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,12 +230,167 @@ async def send_suggestions(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 async def fetch_recipe_ingredients(url: str):
     def _scrape():
-        scraper = scrape_me(url)
-        title = scraper.title() or "Recipe"
-        ingredients = scraper.ingredients() or []
-        return title, ingredients
+        try:
+            scraper = scrape_me(url)
+            title = scraper.title() or "Recipe"
+            ingredients = scraper.ingredients() or []
+            if ingredients:
+                return title, ingredients
+        except Exception:
+            pass
+
+        # Fallback: generic HTML scrape for unsupported sites
+        html_text, status_code = fetch_url_with_fallback(url)
+        soup = BeautifulSoup(html_text, "html.parser")
+
+        title = (soup.title.string.strip() if soup.title and soup.title.string else "Recipe")
+
+        ingredients = []
+        selectors = [
+            "[itemprop='recipeIngredient']",
+            ".recipe-ingredients li",
+            ".ingredients li",
+            ".ingredient li",
+            ".ingredients-item",
+        ]
+        for sel in selectors:
+            for el in soup.select(sel):
+                text = el.get_text(" ", strip=True)
+                if text:
+                    ingredients.append(text)
+            if ingredients:
+                break
+
+        if not ingredients:
+            for section in soup.find_all(["section", "div"]):
+                classes = " ".join(section.get("class", [])).lower()
+                if "ingredient" in classes:
+                    for li in section.find_all("li"):
+                        text = li.get_text(" ", strip=True)
+                        if text:
+                            ingredients.append(text)
+                if ingredients:
+                    break
+
+        if ingredients:
+            return title, ingredients
+
+        raise RuntimeError(f"Could not extract ingredients (HTTP {status_code})")
 
     return await asyncio.to_thread(_scrape)
+
+
+async def fetch_recipe_details(url: str):
+    def _scrape():
+        try:
+            scraper = scrape_me(url)
+            title = scraper.title() or "Recipe"
+            ingredients = scraper.ingredients() or []
+            instructions = scraper.instructions() or ""
+            if ingredients and instructions:
+                return title, ingredients, instructions, None
+        except Exception:
+            pass
+
+        html_text, status_code = fetch_url_with_fallback(url)
+        soup = BeautifulSoup(html_text, "html.parser")
+        title = (soup.title.string.strip() if soup.title and soup.title.string else "Recipe")
+
+        ingredients = []
+        selectors = [
+            "[itemprop='recipeIngredient']",
+            ".recipe-ingredients li",
+            ".ingredients li",
+            ".ingredient li",
+            ".ingredients-item",
+        ]
+        for sel in selectors:
+            for el in soup.select(sel):
+                text = el.get_text(" ", strip=True)
+                if text:
+                    ingredients.append(text)
+            if ingredients:
+                break
+
+        instructions = ""
+        # Try JSON-LD (common on recipe sites)
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+            except Exception:
+                continue
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                recipe = None
+                if item.get("@type") == "Recipe":
+                    recipe = item
+                elif "@graph" in item and isinstance(item["@graph"], list):
+                    for g in item["@graph"]:
+                        if isinstance(g, dict) and g.get("@type") == "Recipe":
+                            recipe = g
+                            break
+                if recipe:
+                    if not ingredients:
+                        ing = recipe.get("recipeIngredient") or []
+                        if isinstance(ing, list):
+                            ingredients.extend([i for i in ing if isinstance(i, str)])
+                    instr = recipe.get("recipeInstructions")
+                    if isinstance(instr, list):
+                        steps = []
+                        for step in instr:
+                            if isinstance(step, str):
+                                steps.append(step)
+                            elif isinstance(step, dict) and "text" in step:
+                                steps.append(step["text"])
+                        instructions = "\n".join([s for s in steps if s])
+                    elif isinstance(instr, str):
+                        instructions = instr
+                    if ingredients and instructions:
+                        break
+            if ingredients and instructions:
+                break
+        instruction_selectors = [
+            "[itemprop='recipeInstructions']",
+            ".recipe-instructions li",
+            ".instructions li",
+            ".instruction li",
+        ]
+        for sel in instruction_selectors:
+            nodes = soup.select(sel)
+            steps = [n.get_text(" ", strip=True) for n in nodes if n.get_text(strip=True)]
+            if steps:
+                instructions = "\n".join(steps)
+                break
+
+        if not instructions:
+            for section in soup.find_all(["section", "div"]):
+                classes = " ".join(section.get("class", [])).lower()
+                if "instruction" in classes or "direction" in classes or "method" in classes:
+                    steps = [li.get_text(" ", strip=True) for li in section.find_all("li")]
+                    steps = [s for s in steps if s]
+                    if steps:
+                        instructions = "\n".join(steps)
+                        break
+
+        return title, ingredients, instructions, html_text
+
+    title, ingredients, instructions, html_text = await asyncio.to_thread(_scrape)
+
+    if (not instructions or not ingredients) and html_text and llm_enabled():
+        extracted = await llm_extract_recipe_from_html(url, html_text)
+        if extracted:
+            if not title:
+                title = extracted.get("title", title)
+            if not ingredients:
+                ingredients = extracted.get("ingredients", ingredients)
+            if not instructions:
+                steps = extracted.get("steps", [])
+                if steps:
+                    instructions = "\n".join(steps)
+
+    return title, ingredients, instructions
 
 
 async def start_recipe_session(chat_id: int, url: str, title: str, ingredients: list[str]):
@@ -302,8 +467,9 @@ async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         title, ingredients = await fetch_recipe_ingredients(url)
-    except Exception:
-        await update.message.reply_text("I couldn't read that recipe URL. Try another one.")
+    except Exception as exc:
+        logger.exception("Recipe import failed for %s: %s", url, exc)
+        await update.message.reply_text(f"I couldn't read that recipe URL ({exc}). Try another one.")
         return
 
     if not ingredients:
@@ -321,6 +487,65 @@ async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         recipe_header(title, page, total_pages, selected_count),
         reply_markup=keyboard,
     )
+
+
+def chunk_text(text: str, limit: int = 3800):
+    lines = text.split("\n")
+    chunks = []
+    current = []
+    length = 0
+    for line in lines:
+        if length + len(line) + 1 > limit and current:
+            chunks.append("\n".join(current))
+            current = [line]
+            length = len(line) + 1
+        else:
+            current.append(line)
+            length += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+async def recipe_steps_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+
+    url = " ".join(context.args).strip()
+    if not url:
+        await update.message.reply_text("Usage: /steps <url>")
+        return
+
+    try:
+        title, ingredients, instructions = await fetch_recipe_details(url)
+    except Exception as exc:
+        logger.exception("Recipe steps failed for %s: %s", url, exc)
+        await update.message.reply_text(f"I couldn't read that recipe URL ({exc}). Try another one.")
+        return
+
+    if not ingredients and not instructions:
+        await update.message.reply_text("No ingredients or steps found on that page.")
+        return
+
+    lines = [f"{title}"]
+    if ingredients:
+        lines.append("")
+        lines.append("Ingredients:")
+        for item in ingredients:
+            lines.append(f"- {item}")
+    if instructions:
+        lines.append("")
+        lines.append("Steps:")
+        steps = [s.strip() for s in instructions.split("\n") if s.strip()]
+        if steps:
+            for i, step in enumerate(steps, 1):
+                lines.append(f"{i}. {step}")
+        else:
+            lines.append(instructions.strip())
+
+    message = "\n".join(lines)
+    for chunk in chunk_text(message):
+        await update.message.reply_text(chunk)
 
 
 async def start_remove_session(chat_id: int, items: list[dict]):
@@ -686,12 +911,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Available commands:\n"
         "/add <item> — add an item\n"
         "/remove — select items to remove\n"
-        "/remove <item> — remove a specific item\n"
-        "/removeall <item> — remove all of a specific item\n"
         "/clear — clear the whole list\n"
         "/list — show the current list\n"
         "/suggest — get weekly suggestions now\n"
         "/recipe <url> — import ingredients from a recipe URL\n"
+        "/steps <url> — show ingredients + steps\n"
         "/help — show this help"
     )
     await update.message.reply_text(text)
@@ -708,10 +932,10 @@ def main():
     app.add_handler(CommandHandler("add", add_item))
     app.add_handler(CommandHandler("list", list_items))
     app.add_handler(CommandHandler("remove", remove_item))
-    app.add_handler(CommandHandler("removeall", remove_all))
     app.add_handler(CommandHandler("clear", clear_list))
     app.add_handler(CommandHandler("suggest", suggest_command))
     app.add_handler(CommandHandler("recipe", recipe_command))
+    app.add_handler(CommandHandler("steps", recipe_steps_command))
     app.add_handler(CallbackQueryHandler(handle_suggestion_callback, pattern=r"^(a|r):"))
     app.add_handler(CallbackQueryHandler(handle_recipe_callback, pattern=r"^(ri|ra|rc|rs|rp):"))
     app.add_handler(CallbackQueryHandler(handle_remove_callback, pattern=r"^(rmi|rmp|rma|rmc|rms):"))

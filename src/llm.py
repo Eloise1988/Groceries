@@ -141,3 +141,42 @@ async def llm_select_suggestions(candidates: list[dict], limit: int):
         if isinstance(item, str):
             selected.append(item)
     return selected[:limit]
+
+
+async def llm_extract_recipe_from_html(url: str, html_text: str):
+    system = (
+        "You are a precise recipe extractor. "
+        "Given raw HTML of a recipe page, extract ingredients and steps. "
+        "Return only JSON with keys: title (string), ingredients (array of strings), steps (array of strings). "
+        "Do not invent content. If a field is unknown, return an empty array/string."
+    )
+    payload = {
+        "url": url,
+        "html": html_text[:120000],
+    }
+    user = "Extract the recipe data from this HTML. Return JSON only.\n" + json.dumps(payload, ensure_ascii=False)
+
+    def _run():
+        return _call_llm(system, user, max_output_tokens=800)
+
+    text = await asyncio.to_thread(_run)
+    try:
+        obj = json.loads(text) if text else None
+    except Exception:
+        return None
+
+    if not isinstance(obj, dict):
+        return None
+
+    title = obj.get("title") if isinstance(obj.get("title"), str) else ""
+    ingredients = obj.get("ingredients") if isinstance(obj.get("ingredients"), list) else []
+    steps = obj.get("steps") if isinstance(obj.get("steps"), list) else []
+
+    ingredients = [i.strip() for i in ingredients if isinstance(i, str) and i.strip()]
+    steps = [s.strip() for s in steps if isinstance(s, str) and s.strip()]
+
+    return {
+        "title": title.strip(),
+        "ingredients": ingredients,
+        "steps": steps,
+    }
