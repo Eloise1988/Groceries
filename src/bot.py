@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import json
+import re
 from math import ceil
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
@@ -24,7 +25,7 @@ from .config import BOT_TOKEN, ADMIN_CHAT_ID_INT, SUGGESTION_COUNT, TIMEZONE
 from .db import get_db
 from .llm import llm_enabled, llm_parse_ingredients, llm_extract_recipe_from_html
 from .suggestions import build_suggestions, record_feedback
-from .utils import normalize_item, parse_item, now_utc, simplify_ingredient
+from .utils import normalize_item, parse_item, parse_items, now_utc, simplify_ingredient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -102,7 +103,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "Ready. Use /add <item> to add groceries, /list to see your list, and /suggest for weekly proposals."
+        "Ready. Use /add <item> (or /add item1, item2) to add groceries, /list to see your list, and /suggest for weekly proposals."
     )
 
 
@@ -110,55 +111,95 @@ async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update):
         return
 
-    text = " ".join(context.args)
-    name_raw = parse_item(text)
-    if not name_raw:
+    text = ""
+    if update.message and update.message.text:
+        # Handles /add and /add@BotName forms.
+        text = re.sub(r"^/\w+(?:@\w+)?\s*", "", update.message.text, count=1).strip()
+    if not text:
+        text = " ".join(context.args)
+
+    names_raw = parse_items(text)
+    if not names_raw:
         await update.message.reply_text("Usage: /add <item>")
         return
 
-    name = normalize_item(name_raw)
     db = get_db()
     items = db.items
     stats = db.stats
+    added = []
+    failed = []
+    failure_reasons = []
+    seen = set()
+    for name_raw in names_raw:
+        name = normalize_item(name_raw)
+        if not name or name in seen:
+            continue
+        seen.add(name)
 
-    await items.update_one(
-        {"chat_id": update.effective_chat.id, "name": name},
-        {
-            "$set": {"display_name": name_raw, "updated_at": now_utc()},
-            "$setOnInsert": {
-                "chat_id": update.effective_chat.id,
-                "name": name,
-                "created_at": now_utc(),
-            },
-        },
-        upsert=True,
-    )
+        try:
+            await items.update_one(
+                {"chat_id": update.effective_chat.id, "name": name},
+                {
+                    "$set": {"display_name": name_raw, "updated_at": now_utc()},
+                    "$setOnInsert": {
+                        "chat_id": update.effective_chat.id,
+                        "name": name,
+                        "created_at": now_utc(),
+                    },
+                },
+                upsert=True,
+            )
+            added.append(name_raw)
+        except Exception as exc:
+            logger.exception("Failed adding item '%s': %s", name_raw, exc)
+            failed.append(name_raw)
+            failure_reasons.append(f"{name_raw}: {type(exc).__name__}: {exc}")
+            continue
 
-    await stats.update_one(
-        {"chat_id": update.effective_chat.id, "name": name},
-        {
-            "$inc": {"accepts": 1},
-            "$set": {"display_name": name_raw, "updated_at": now_utc()},
-            "$setOnInsert": {
-                "chat_id": update.effective_chat.id,
-                "name": name,
-                "created_at": now_utc(),
-                "accepts": 0,
-                "rejects": 0,
-            },
-        },
-        upsert=True,
-    )
+        # Learning stats must not block adding an item to the list.
+        try:
+            await stats.update_one(
+                {"chat_id": update.effective_chat.id, "name": name},
+                {
+                    "$inc": {"accepts": 1},
+                    "$set": {"display_name": name_raw, "updated_at": now_utc()},
+                    "$setOnInsert": {
+                        "chat_id": update.effective_chat.id,
+                        "name": name,
+                        "created_at": now_utc(),
+                        "accepts": 0,
+                        "rejects": 0,
+                    },
+                },
+                upsert=True,
+            )
+        except Exception as exc:
+            logger.exception("Failed updating stats for item '%s': %s", name_raw, exc)
 
-    await update.message.reply_text(f"Added {name_raw}.")
-
-
-async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
+    if not added:
+        if failed:
+            details = "; ".join(failure_reasons)
+            await update.message.reply_text("Couldn't add items: " + ", ".join(failed) + f". Reason: {details}")
+        else:
+            await update.message.reply_text("No valid items found. Use commas to separate items.")
         return
 
-    db = get_db()
-    cursor = db.items.find({"chat_id": update.effective_chat.id}).sort("display_name", 1)
+    if len(added) == 1:
+        message = f"Added {added[0]}."
+    else:
+        message = "Added: " + ", ".join(added) + "."
+
+    if failed:
+        message += " Couldn't add: " + ", ".join(failed) + "."
+        if failure_reasons:
+            message += " Reason: " + "; ".join(failure_reasons)
+
+    list_text = await build_list_text(db, update.effective_chat.id)
+    await update.message.reply_text(message + "\n\n" + list_text)
+
+
+async def build_list_text(db, chat_id: int):
+    cursor = db.items.find({"chat_id": chat_id}).sort("display_name", 1)
 
     lines = []
     async for doc in cursor:
@@ -166,10 +207,18 @@ async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"- {display}")
 
     if not lines:
-        await update.message.reply_text("Your list is empty.")
+        return "Your list is empty."
+
+    return "Your grocery list:\n" + "\n".join(lines)
+
+
+async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
         return
 
-    await update.message.reply_text("Your grocery list:\n" + "\n".join(lines))
+    db = get_db()
+    list_text = await build_list_text(db, update.effective_chat.id)
+    await update.message.reply_text(list_text)
 
 
 async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -909,7 +958,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = (
         "Available commands:\n"
-        "/add <item> — add an item\n"
+        "/add <item> — add one item (comma-separated supported)\n"
         "/remove — select items to remove\n"
         "/clear — clear the whole list\n"
         "/list — show the current list\n"

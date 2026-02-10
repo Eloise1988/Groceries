@@ -13,6 +13,16 @@ def parse_item(text: str):
     return raw
 
 
+def parse_items(text: str):
+    raw = text.strip()
+    if not raw:
+        return []
+
+    # Support commas/newlines/semicolons and common unicode comma variants.
+    parts = [part.strip() for part in re.split(r"[,\n;，、،]+", raw)]
+    return [part for part in parts if part and not part.startswith("/")]
+
+
 _UNITS = {
     "teaspoon", "teaspoons", "tsp", "tsp.",
     "tablespoon", "tablespoons", "tbsp", "tbsp.",
